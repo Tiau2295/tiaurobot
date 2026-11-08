@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+Grok Bot Terminal - Multi-Agent Solana Memecoin Desk (Educational)
+Inspired by the viral Grok Bot Terminal screenshots.
+
+Agents:
+  SCANNER  → new pairs / volume spikes (DexScreener)
+  RUG CHECK → filters suspicious tokens (RugCheck.xyz free API)
+  SIZER    → position from account equity %
+  EXECUTOR → paper (default) or Jupiter live
+  LOGGER   → every decision has a reason
+  EQUITY   → balance + simple curve
+
+⚠️  PAPER MODE BY DEFAULT. Live trading is extremely risky.
+"""
+
+import os
+import time
+import json
+import logging
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
+POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT", "0.25"))
+MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "200"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))
+MAX_TOP10_HOLDERS_PCT = float(os.getenv("MAX_TOP10_HOLDERS_PCT", "25"))
+MAX_RISK_SCORE = int(os.getenv("MAX_RISK_SCORE", "400"))  # RugCheck higher = riskier
+SCAN_INTERVAL_SEC = 30
+LOG_FILE = Path("night.log")
+
+RPC_URL = os.getenv("RPC_URL") or "https://api.mainnet-beta.solana.com"
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+
+# ────────────────────────────────────────────────
+# Logging
+# ────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, mode="a"),
+    ],
+)
+log = logging.getLogger("GrokBot")
+
+# ────────────────────────────────────────────────
+# Data models
+# ────────────────────────────────────────────────
+@dataclass
+class TokenCandidate:
+    mint: str
+    symbol: str
+    name: str
+    pair_address: str
+    liquidity_usd: float
+    volume_h1: float
+    price_usd: float
+    age_minutes: float
+    reason: str = ""
+
+@dataclass
+class Position:
+    mint: str
+    symbol: str
+    entry_price: float
+    size_usd: float
+    size_tokens: float
+    entry_time: datetime
+    reason: str
+    status: str = "OPEN"  # OPEN / CLOSED
+    exit_price: Optional[float] = None
+    pnl_usd: float = 0.0
+    exit_reason: str = ""
+
+@dataclass
+class EquityState:
+    balance: float = 100.0          # starting paper equity
+    peak: float = 100.0
+    wins: int = 0
+    losses: int = 0
+    trades: List[Position] = field(default_factory=list)
+    open_positions: Dict[str, Position] = field(default_factory=dict)
+
+# ────────────────────────────────────────────────
+# Agents
+# ────────────────────────────────────────────────
+class Scanner:
+    """SCANNER — new pairs + volume spikes via DexScreener"""
+
+    BASE = "https://api.dexscreener.com/latest/dex"
+
+    def scan(self) -> List[TokenCandidate]:
+        candidates = []
+        try:
+            # Latest boosted / profiles (good proxy for activity)
+            r = requests.get(f"{self.BASE}/token-boosts/latest/v1", timeout=10)
+            if r.status_code == 200:
+                for item in r.json()[:15]:
+                    if item.get("chainId") != "solana":
+                        continue
+                    mint = item.get("tokenAddress")
+                    if not mint:
+                        continue
+                    # Enrich with pair data
+                    pair_r = requests.get(f"{self.BASE}/tokens/{mint}", timeout=8)
+                    if pair_r.status_code != 200:
+                        continue
+                    pairs = pair_r.json().get("pairs") or []
+                    sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                    if not sol_pairs:
+                        continue
+                    p = max(sol_pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0))
+                    liq = float((p.get("liquidity") or {}).get("usd") or 0)
+                    vol = float((p.get("volume") or {}).get("h1") or 0)
+                    price = float(p.get("priceUsd") or 0)
+                    created = p.get("pairCreatedAt") or 0
+                    age_min = (time.time() * 1000 - created) / 60000 if created else 9999
+
+                    if liq < MIN_LIQUIDITY_USD:
+                        continue
+
+                    candidates.append(TokenCandidate(
+                        mint=mint,
+                        symbol=p.get("baseToken", {}).get("symbol", "?"),
+                        name=p.get("baseToken", {}).get("name", "?"),
+                        pair_address=p.get("pairAddress", ""),
+                        liquidity_usd=liq,
+                        volume_h1=vol,
+                        price_usd=price,
+                        age_minutes=age_min,
+                        reason=f"boosted + liq ${liq:,.0f} vol1h ${vol:,.0f}"
+                    ))
+        except Exception as e:
+            log.warning(f"Scanner error: {e}")
+        return candidates
+
+class RugCheck:
+    """RUG CHECK — free RugCheck.xyz API. Nothing executes before a pass."""
+
+    BASE = "https://api.rugcheck.xyz/v1"
+
+    def check(self, mint: str) -> tuple[bool, str, dict]:
+        try:
+            r = requests.get(f"{self.BASE}/tokens/{mint}/report/summary", timeout=12)
+            if r.status_code != 200:
+                return False, f"API {r.status_code}", {}
+
+            data = r.json()
+            score = data.get("score", 9999)
+            mint_auth = data.get("mintAuthority")
+            freeze_auth = data.get("freezeAuthority")
+            lp_locked = data.get("lpLocked", False)
+            top10 = float(data.get("topHoldersPct") or 100)
+            risks = data.get("risks") or []
+
+            reasons = []
+            if mint_auth is not None:
+                reasons.append("mint authority still active")
+            if freeze_auth is not None:
+                reasons.append("freeze authority still active")
+            if not lp_locked:
+                reasons.append("LP not locked")
+            if top10 > MAX_TOP10_HOLDERS_PCT:
+                reasons.append(f"top10 holders {top10:.1f}% > {MAX_TOP10_HOLDERS_PCT}%")
+            if score > MAX_RISK_SCORE:
+                reasons.append(f"risk score {score} > {MAX_RISK_SCORE}")
+
+            if reasons:
+                return False, " | ".join(reasons), data
+
+            return True, f"PASS score={score} top10={top10:.1f}% LP locked", data
+        except Exception as e:
+            return False, f"RugCheck error: {e}", {}
+
+class Sizer:
+    """SIZER — size from account equity, never a fixed ticket"""
+
+    def size(self, equity: float) -> float:
+        size = equity * POSITION_SIZE_PCT
+        return round(size, 2)
+
+class Executor:
+    """EXECUTOR — paper by default. Live Jupiter is gated."""
+
+    def __init__(self, equity_state: EquityState):
+        self.eq = equity_state
+
+    def enter(self, candidate: TokenCandidate, size_usd: float, reason: str) -> Optional[Position]:
+        if size_usd > self.eq.balance * 0.95:
+            log.info(f"  SKIP size ${size_usd} too large vs balance ${self.eq.balance:.2f}")
+            return None
+
+        if PAPER_MODE:
+            # Paper fill at current price
+            tokens = size_usd / candidate.price_usd if candidate.price_usd > 0 else 0
+            pos = Position(
+                mint=candidate.mint,
+                symbol=candidate.symbol,
+                entry_price=candidate.price_usd,
+                size_usd=size_usd,
+                size_tokens=tokens,
+                entry_time=datetime.now(timezone.utc),
+                reason=reason,
+            )
+            self.eq.balance -= size_usd
+            self.eq.open_positions[candidate.mint] = pos
+            log.info(f"  PAPER ENTER ${candidate.symbol} size ${size_usd:.2f} @ ${candidate.price_usd:.8f} | {reason}")
+            return pos
+        else:
+            log.warning("Live mode not fully implemented in this educational script. Stay in PAPER_MODE=true")
+            # Real Jupiter flow would go here (quote → swap → sign → send)
+            # See official Jupiter Python examples for production code.
+            return None
+
+    def maybe_exit(self, mint: str, current_price: float, reason: str = "manual"):
+        pos = self.eq.open_positions.get(mint)
+        if not pos:
+            return
+        pnl = (current_price - pos.entry_price) / pos.entry_price * pos.size_usd
+        pos.exit_price = current_price
+        pos.pnl_usd = pnl
+        pos.status = "CLOSED"
+        pos.exit_reason = reason
+        self.eq.balance += pos.size_usd + pnl
+        self.eq.trades.append(pos)
+        del self.eq.open_positions[mint]
+        if pnl >= 0:
+            self.eq.wins += 1
+        else:
+            self.eq.losses += 1
+        log.info(f"  EXIT ${pos.symbol} PnL ${pnl:+.2f} | {reason}")
+
+class LoggerAgent:
+    """LOGGER — every decision has a reason"""
+
+    def log_decision(self, action: str, details: str):
+        log.info(f"{action.upper():12} | {details}")
+
+# ────────────────────────────────────────────────
+# Orchestrator
+# ────────────────────────────────────────────────
+class GrokBotTerminal:
+    def __init__(self):
+        self.eq = EquityState(balance=float(os.getenv("START_BALANCE", "100")))
+        self.scanner = Scanner()
+        self.rug = RugCheck()
+        self.sizer = Sizer()
+        self.executor = Executor(self.eq)
+        self.logger = LoggerAgent()
+        self.seen = set()
+
+    def run_once(self):
+        log.info("─" * 60)
+        log.info(f"SCAN cycle | balance ${self.eq.balance:.2f} | open {len(self.eq.open_positions)} | W/L {self.eq.wins}/{self.eq.losses}")
+
+        candidates = self.scanner.scan()
+        log.info(f"Scanner found {len(candidates)} candidates")
+
+        for c in candidates:
+            if c.mint in self.seen or c.mint in self.eq.open_positions:
+                continue
+            self.seen.add(c.mint)
+
+            # Rug Check (hard gate)
+            passed, reason, data = self.rug.check(c.mint)
+            if not passed:
+                self.logger.log_decision("FILTERED", f"${c.symbol} | {reason}")
+                continue
+
+            self.logger.log_decision("PASS", f"${c.symbol} | {reason}")
+
+            # Size
+            size = self.sizer.size(self.eq.balance)
+            if size < 5:
+                continue
+
+            # Execute
+            entry_reason = f"new pair · {c.reason} · RugCheck pass"
+            self.executor.enter(c, size, entry_reason)
+
+        # Simple exit example (replace with your real exit logic)
+        # for mint, pos in list(self.eq.open_positions.items()):
+        #     # fetch current price and decide
+        #     pass
+
+    def status(self):
+        log.info(f"EQUITY  ${self.eq.balance:.2f}  |  trades {len(self.eq.trades)}  |  W {self.eq.wins} L {self.eq.losses}")
+
+    def run(self, cycles: int = 0):
+        log.info("Grok Bot Terminal starting (PAPER_MODE=%s)", PAPER_MODE)
+        log.info("Every trade gets a reason. Nothing executes before a RugCheck PASS.")
+        i = 0
+        while cycles == 0 or i < cycles:
+            try:
+                self.run_once()
+                self.status()
+                time.sleep(SCAN_INTERVAL_SEC)
+                i += 1
+            except KeyboardInterrupt:
+                log.info("Stopped by user")
+                break
+            except Exception as e:
+                log.error(f"Loop error: {e}")
+                time.sleep(10)
+
+if __name__ == "__main__":
+    bot = GrokBotTerminal()
+    bot.run()  # run forever, or bot.run(cycles=10)
